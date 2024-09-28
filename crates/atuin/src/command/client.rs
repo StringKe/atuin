@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use clap::Subcommand;
 use eyre::{Result, WrapErr};
 
-use atuin_client::{database::Sqlite, record::sqlite_store::SqliteStore, settings::Settings};
+use atuin_client::{
+    database::Sqlite, record::sqlite_store::SqliteStore, settings::Settings, theme,
+};
 use tracing_subscriber::{filter::EnvFilter, fmt, prelude::*};
 
 #[cfg(feature = "sync")]
@@ -76,11 +78,12 @@ pub enum Cmd {
     #[command()]
     Doctor,
 
+    /// *Experimental* Start the background daemon
     #[cfg(feature = "daemon")]
     #[command()]
     Daemon,
 
-    /// Print example configuration
+    /// Print the default atuin configuration (config.toml)
     #[command()]
     DefaultConfig,
 }
@@ -93,14 +96,19 @@ impl Cmd {
             .unwrap();
 
         let settings = Settings::new().wrap_err("could not load client settings")?;
-        let res = runtime.block_on(self.run_inner(settings));
+        let theme_manager = theme::ThemeManager::new(settings.theme.debug, None);
+        let res = runtime.block_on(self.run_inner(settings, theme_manager));
 
         runtime.shutdown_timeout(std::time::Duration::from_millis(50));
 
         res
     }
 
-    async fn run_inner(self, mut settings: Settings) -> Result<()> {
+    async fn run_inner(
+        self,
+        mut settings: Settings,
+        mut theme_manager: theme::ThemeManager,
+    ) -> Result<()> {
         let filter =
             EnvFilter::from_env("ATUIN_LOG").add_directive("sqlx_sqlite::regexp=off".parse()?);
 
@@ -111,17 +119,28 @@ impl Cmd {
 
         tracing::trace!(command = ?self, "client command");
 
+        // Skip initializing any databases for history
+        // This is a pretty hot path, as it runs before and after every single command the user
+        // runs
+        match self {
+            Self::History(history) => return history.run(&settings).await,
+            Self::Init(init) => return init.run(&settings).await,
+            _ => {}
+        }
+
         let db_path = PathBuf::from(settings.db_path.as_str());
         let record_store_path = PathBuf::from(settings.record_store_path.as_str());
 
         let db = Sqlite::new(db_path, settings.local_timeout).await?;
         let sqlite_store = SqliteStore::new(record_store_path, settings.local_timeout).await?;
 
+        let theme_name = settings.theme.name.clone();
+        let theme = theme_manager.load_theme(theme_name.as_str(), settings.theme.max_depth);
+
         match self {
-            Self::History(history) => history.run(&settings, &db, sqlite_store).await,
             Self::Import(import) => import.run(&db).await,
-            Self::Stats(stats) => stats.run(&db, &settings).await,
-            Self::Search(search) => search.run(db, &mut settings, sqlite_store).await,
+            Self::Stats(stats) => stats.run(&db, &settings, theme).await,
+            Self::Search(search) => search.run(db, &mut settings, sqlite_store, theme).await,
 
             #[cfg(feature = "sync")]
             Self::Sync(sync) => sync.run(settings, &db, sqlite_store).await,
@@ -135,14 +154,12 @@ impl Cmd {
 
             Self::Dotfiles(dotfiles) => dotfiles.run(&settings, sqlite_store).await,
 
-            Self::Init(init) => init.run(&settings).await,
-
             Self::Info => {
                 info::run(&settings);
                 Ok(())
             }
 
-            Self::Doctor => doctor::run(&settings),
+            Self::Doctor => doctor::run(&settings).await,
 
             Self::DefaultConfig => {
                 default_config::run();
@@ -151,6 +168,8 @@ impl Cmd {
 
             #[cfg(feature = "daemon")]
             Self::Daemon => daemon::run(settings, sqlite_store, db).await,
+
+            _ => unimplemented!(),
         }
     }
 }

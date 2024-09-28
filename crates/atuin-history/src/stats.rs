@@ -4,7 +4,7 @@ use crossterm::style::{Color, ResetColor, SetAttribute, SetForegroundColor};
 use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 
-use atuin_client::{history::History, settings::Settings};
+use atuin_client::{history::History, settings::Settings, theme::Meaning, theme::Theme};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Stats {
@@ -92,7 +92,7 @@ fn split_at_pipe(command: &str) -> Vec<&str> {
             "\\" => if graphemes.next().is_some() {},
             "|" => {
                 if !quoted {
-                    if command[start..].starts_with('|') {
+                    if current > start && command[start..].starts_with('|') {
                         start += 1;
                     }
                     result.push(&command[start..current]);
@@ -109,7 +109,7 @@ fn split_at_pipe(command: &str) -> Vec<&str> {
     result
 }
 
-pub fn pretty_print(stats: Stats, ngram_size: usize) {
+pub fn pretty_print(stats: Stats, ngram_size: usize, theme: &Theme) {
     let max = stats.top.iter().map(|x| x.1).max().unwrap();
     let num_pad = max.ilog10() as usize + 1;
 
@@ -126,21 +126,42 @@ pub fn pretty_print(stats: Stats, ngram_size: usize) {
         });
 
     for (command, count) in stats.top {
-        let gray = SetForegroundColor(Color::Grey);
+        let gray = SetForegroundColor(match theme.as_style(Meaning::Muted).foreground_color {
+            Some(color) => color,
+            None => Color::Grey,
+        });
         let bold = SetAttribute(crossterm::style::Attribute::Bold);
 
         let in_ten = 10 * count / max;
 
         print!("[");
-        print!("{}", SetForegroundColor(Color::Red));
+        print!(
+            "{}",
+            SetForegroundColor(match theme.get_error().foreground_color {
+                Some(color) => color,
+                None => Color::Red,
+            })
+        );
 
         for i in 0..in_ten {
             if i == 2 {
-                print!("{}", SetForegroundColor(Color::Yellow));
+                print!(
+                    "{}",
+                    SetForegroundColor(match theme.get_warning().foreground_color {
+                        Some(color) => color,
+                        None => Color::Yellow,
+                    })
+                );
             }
 
             if i == 5 {
-                print!("{}", SetForegroundColor(Color::Green));
+                print!(
+                    "{}",
+                    SetForegroundColor(match theme.get_info().foreground_color {
+                        Some(color) => color,
+                        None => Color::Green,
+                    })
+                );
             }
 
             print!("▮");
@@ -394,6 +415,22 @@ mod tests {
         assert_eq!(
             split_at_pipe("git commit -m \"🚀\""),
             ["git commit -m \"🚀\""]
+        );
+    }
+
+    #[test]
+    fn starts_with_pipe() {
+        assert_eq!(
+            split_at_pipe("| sed 's/[0-9a-f]//g'"),
+            ["", " sed 's/[0-9a-f]//g'"]
+        );
+    }
+
+    #[test]
+    fn starts_with_spaces_and_pipe() {
+        assert_eq!(
+            split_at_pipe("  | sed 's/[0-9a-f]//g'"),
+            ["  ", " sed 's/[0-9a-f]//g'"]
         );
     }
 }

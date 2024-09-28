@@ -38,6 +38,11 @@ pub async fn worker(
         ticker.tick().await;
         tracing::info!("sync worker tick");
 
+        if !settings.logged_in() {
+            tracing::debug!("not logged in, skipping sync tick");
+            continue;
+        }
+
         let res = sync::sync(&settings, &store).await;
 
         if let Err(e) = res {
@@ -75,6 +80,9 @@ pub async fn worker(
             if ticker.period().as_secs() != settings.daemon.sync_frequency {
                 ticker = time::interval(time::Duration::from_secs(settings.daemon.sync_frequency));
             }
+
+            // store sync time
+            tokio::task::spawn_blocking(Settings::save_sync_time).await??;
         }
     }
 }

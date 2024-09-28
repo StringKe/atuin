@@ -1,10 +1,5 @@
 use std::{
-    collections::HashMap,
-    convert::TryFrom,
-    fmt,
-    io::prelude::*,
-    path::{Path, PathBuf},
-    str::FromStr,
+    collections::HashMap, convert::TryFrom, fmt, io::prelude::*, path::PathBuf, str::FromStr,
 };
 
 use atuin_common::record::HostId;
@@ -14,7 +9,7 @@ use config::{
 };
 use eyre::{bail, eyre, Context, Error, Result};
 use fs_err::{create_dir_all, File};
-use parse_duration::parse;
+use humantime::parse_duration;
 use regex::RegexSet;
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -335,6 +330,7 @@ pub struct Sync {
 #[derive(Clone, Debug, Deserialize, Default, Serialize)]
 pub struct Keys {
     pub scroll_exits: bool,
+    pub prefix: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -343,9 +339,22 @@ pub struct Preview {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Theme {
+    /// Name of desired theme ("default" for base)
+    pub name: String,
+
+    /// Whether any available additional theme debug should be shown
+    pub debug: Option<bool>,
+
+    /// How many levels of parenthood will be traversed if needed
+    pub max_depth: Option<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Daemon {
     /// Use the daemon to sync
     /// If enabled, requires a running daemon with `atuin daemon`
+    #[serde(alias = "enable")]
     pub enabled: bool,
 
     /// The daemon will handle sync on an interval. How often to sync, in seconds.
@@ -353,6 +362,12 @@ pub struct Daemon {
 
     /// The path to the unix socket used by the daemon
     pub socket_path: String,
+
+    /// Use a socket passed via systemd's socket activation protocol, instead of the path
+    pub systemd_socket: bool,
+
+    /// The port that should be used for TCP on non unix systems
+    pub tcp_port: u64,
 }
 
 impl Default for Preview {
@@ -363,12 +378,24 @@ impl Default for Preview {
     }
 }
 
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            name: "".to_string(),
+            debug: None::<bool>,
+            max_depth: Some(10),
+        }
+    }
+}
+
 impl Default for Daemon {
     fn default() -> Self {
         Self {
             enabled: false,
             sync_frequency: 300,
             socket_path: "".to_string(),
+            systemd_socket: false,
+            tcp_port: 8889,
         }
     }
 }
@@ -383,6 +410,10 @@ pub enum PreviewStrategy {
     // Preview height is calculated for the length of the longest command stored in the history.
     #[serde(rename = "static")]
     Static,
+
+    // max_preview_height is used as fixed height.
+    #[serde(rename = "fixed")]
+    Fixed,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -454,10 +485,8 @@ pub struct Settings {
     #[serde(default)]
     pub daemon: Daemon,
 
-    // This is automatically loaded when settings is created. Do not set in
-    // config! Keep secrets and settings apart.
-    #[serde(skip)]
-    pub session_token: String,
+    #[serde(default)]
+    pub theme: Theme,
 }
 
 impl Settings {
@@ -554,13 +583,32 @@ impl Settings {
             return Ok(false);
         }
 
-        match parse(self.sync_frequency.as_str()) {
+        if self.sync_frequency == "0" {
+            return Ok(true);
+        }
+
+        match parse_duration(self.sync_frequency.as_str()) {
             Ok(d) => {
                 let d = time::Duration::try_from(d).unwrap();
                 Ok(OffsetDateTime::now_utc() - Settings::last_sync()? >= d)
             }
             Err(e) => Err(eyre!("failed to check sync: {}", e)),
         }
+    }
+
+    pub fn logged_in(&self) -> bool {
+        let session_path = self.session_path.as_str();
+
+        PathBuf::from(session_path).exists()
+    }
+
+    pub fn session_token(&self) -> Result<String> {
+        if !self.logged_in() {
+            return Err(eyre!("Tried to load session; not logged in"));
+        }
+
+        let session_path = self.session_path.as_str();
+        Ok(fs_err::read_to_string(session_path)?)
     }
 
     #[cfg(feature = "check-update")]
@@ -648,7 +696,7 @@ impl Settings {
         let data_dir = atuin_common::utils::data_dir();
         let db_path = data_dir.join("history.db");
         let record_store_path = data_dir.join("records.db");
-        let socket_path = data_dir.join("atuin.sock");
+        let socket_path = atuin_common::utils::runtime_dir().join("atuin.sock");
 
         let key_path = data_dir.join("key");
         let session_path = data_dir.join("session");
@@ -667,8 +715,8 @@ impl Settings {
             .set_default("sync_frequency", "10m")?
             .set_default("search_mode", "fuzzy")?
             .set_default("filter_mode", "global")?
-            .set_default("style", "auto")?
-            .set_default("inline_height", 0)?
+            .set_default("style", "compact")?
+            .set_default("inline_height", 40)?
             .set_default("show_preview", true)?
             .set_default("preview.strategy", "auto")?
             .set_default("max_preview_height", 4)?
@@ -683,7 +731,6 @@ impl Settings {
             )?
             .set_default("scroll_context_lines", 1)?
             .set_default("shell_up_key_binding", false)?
-            .set_default("session_token", "")?
             .set_default("workspaces", false)?
             .set_default("ctrl_n_shortcuts", false)?
             .set_default("secrets_filter", true)?
@@ -696,8 +743,9 @@ impl Settings {
             // muscle memory.
             // New users will get the new default, that is more similar to what they are used to.
             .set_default("enter_accept", false)?
-            .set_default("sync.records", false)?
+            .set_default("sync.records", true)?
             .set_default("keys.scroll_exits", true)?
+            .set_default("keys.prefix", "a")?
             .set_default("keymap_mode", "emacs")?
             .set_default("keymap_mode_shell", "auto")?
             .set_default("keymap_cursor", HashMap::<String, String>::new())?
@@ -706,6 +754,10 @@ impl Settings {
             .set_default("daemon.sync_frequency", 300)?
             .set_default("daemon.enabled", false)?
             .set_default("daemon.socket_path", socket_path.to_str())?
+            .set_default("daemon.systemd_socket", false)?
+            .set_default("daemon.tcp_port", 8889)?
+            .set_default("theme.name", "default")?
+            .set_default("theme.debug", None::<bool>)?
             .set_default(
                 "prefers_reduced_motion",
                 std::env::var("NO_MOTION")
@@ -772,14 +824,6 @@ impl Settings {
         let session_path = shellexpand::full(&session_path)?;
         settings.session_path = session_path.to_string();
 
-        // Finally, set the auth token
-        if Path::new(session_path.to_string().as_str()).exists() {
-            let token = fs_err::read_to_string(session_path.to_string())?;
-            settings.session_token = token.trim().to_string();
-        } else {
-            settings.session_token = String::from("not logged in");
-        }
-
         Ok(settings)
     }
 
@@ -799,6 +843,16 @@ impl Default for Settings {
             .try_deserialize()
             .expect("Could not deserialize config")
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_local_timeout() -> f64 {
+    std::env::var("ATUIN_TEST_LOCAL_TIMEOUT")
+        .ok()
+        .and_then(|x| x.parse().ok())
+        // this hardcoded value should be replaced by a simple way to get the
+        // default local_timeout of Settings if possible
+        .unwrap_or(2.0)
 }
 
 #[cfg(test)]

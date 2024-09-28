@@ -1,6 +1,7 @@
 use std::{
     fmt::{self, Display},
     io::{self, IsTerminal, Write},
+    path::PathBuf,
     time::Duration,
 };
 
@@ -10,7 +11,7 @@ use eyre::{Context, Result};
 use runtime_format::{FormatKey, FormatKeyError, ParseSegment, ParsedFmt};
 
 use atuin_client::{
-    database::{current_context, Database},
+    database::{current_context, Database, Sqlite},
     encryption,
     history::{store::HistoryStore, History},
     record::sqlite_store::SqliteStore,
@@ -314,24 +315,46 @@ impl Cmd {
             return Ok(());
         }
 
-        if settings.daemon.enabled {
-            let resp =
-                atuin_daemon::client::HistoryClient::new(settings.daemon.socket_path.clone())
-                    .await?
-                    .start_history(h)
-                    .await?;
-
-            // print the ID
-            // we use this as the key for calling end
-            println!("{resp}");
-
-            return Ok(());
-        }
-
         // print the ID
         // we use this as the key for calling end
         println!("{}", h.id);
         db.save(&h).await?;
+
+        Ok(())
+    }
+
+    #[cfg(feature = "daemon")]
+    async fn handle_daemon_start(settings: &Settings, command: &[String]) -> Result<()> {
+        let command = command.join(" ");
+
+        // It's better for atuin to silently fail here and attempt to
+        // store whatever is ran, than to throw an error to the terminal
+        let cwd = utils::get_current_dir();
+
+        let h: History = History::capture()
+            .timestamp(OffsetDateTime::now_utc())
+            .command(command)
+            .cwd(cwd)
+            .build()
+            .into();
+
+        if !h.should_save(settings) {
+            return Ok(());
+        }
+
+        let resp = atuin_daemon::client::HistoryClient::new(
+            #[cfg(not(unix))]
+            settings.daemon.tcp_port,
+            #[cfg(unix)]
+            settings.daemon.socket_path.clone(),
+        )
+        .await?
+        .start_history(h)
+        .await?;
+
+        // print the ID
+        // we use this as the key for calling end
+        println!("{resp}");
 
         Ok(())
     }
@@ -346,18 +369,6 @@ impl Cmd {
         exit: i64,
         duration: Option<u64>,
     ) -> Result<()> {
-        // If the daemon is enabled, use it. Ignore the rest.
-        // We will need to keep the old code around for a while.
-        // At the very least, while this is opt-in
-        if settings.daemon.enabled {
-            atuin_daemon::client::HistoryClient::new(settings.daemon.socket_path.clone())
-                .await?
-                .end_history(id.to_string(), duration.unwrap_or(0), exit)
-                .await?;
-
-            return Ok(());
-        }
-
         if id.trim() == "" {
             return Ok(());
         }
@@ -374,7 +385,7 @@ impl Cmd {
             return Ok(());
         }
 
-        if !settings.store_failed && h.exit != 0 {
+        if !settings.store_failed && exit > 0 {
             debug!("history has non-zero exit code, and store_failed is false");
 
             // the history has already been inserted half complete. remove it
@@ -411,6 +422,27 @@ impl Cmd {
         } else {
             debug!("sync disabled! not syncing");
         }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "daemon")]
+    #[allow(unused_variables)]
+    async fn handle_daemon_end(
+        settings: &Settings,
+        id: &str,
+        exit: i64,
+        duration: Option<u64>,
+    ) -> Result<()> {
+        let resp = atuin_daemon::client::HistoryClient::new(
+            #[cfg(not(unix))]
+            settings.daemon.tcp_port,
+            #[cfg(unix)]
+            settings.daemon.socket_path.clone(),
+        )
+        .await?
+        .end_history(id.to_string(), duration.unwrap_or(0), exit)
+        .await?;
 
         Ok(())
     }
@@ -510,13 +542,30 @@ impl Cmd {
         Ok(())
     }
 
-    pub async fn run(
-        self,
-        settings: &Settings,
-        db: &impl Database,
-        store: SqliteStore,
-    ) -> Result<()> {
+    pub async fn run(self, settings: &Settings) -> Result<()> {
         let context = current_context();
+
+        #[cfg(feature = "daemon")]
+        // Skip initializing any databases for start/end, if the daemon is enabled
+        if settings.daemon.enabled {
+            match self {
+                Self::Start { command } => {
+                    return Self::handle_daemon_start(settings, &command).await
+                }
+
+                Self::End { id, exit, duration } => {
+                    return Self::handle_daemon_end(settings, &id, exit, duration).await
+                }
+
+                _ => {}
+            }
+        }
+
+        let db_path = PathBuf::from(settings.db_path.as_str());
+        let record_store_path = PathBuf::from(settings.record_store_path.as_str());
+
+        let db = Sqlite::new(db_path, settings.local_timeout).await?;
+        let store = SqliteStore::new(record_store_path, settings.local_timeout).await?;
 
         let encryption_key: [u8; 32] = encryption::load_key(settings)
             .context("could not load encryption key")?
@@ -526,9 +575,9 @@ impl Cmd {
         let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
 
         match self {
-            Self::Start { command } => Self::handle_start(db, settings, &command).await,
+            Self::Start { command } => Self::handle_start(&db, settings, &command).await,
             Self::End { id, exit, duration } => {
-                Self::handle_end(db, store, history_store, settings, &id, exit, duration).await
+                Self::handle_end(&db, store, history_store, settings, &id, exit, duration).await
             }
             Self::List {
                 session,
@@ -543,7 +592,7 @@ impl Cmd {
                 let mode = ListMode::from_flags(human, cmd_only);
                 let tz = timezone.unwrap_or(settings.timezone);
                 Self::handle_list(
-                    db, settings, context, session, cwd, mode, format, false, print0, reverse, tz,
+                    &db, settings, context, session, cwd, mode, format, false, print0, reverse, tz,
                 )
                 .await
             }
@@ -572,10 +621,10 @@ impl Cmd {
                 Ok(())
             }
 
-            Self::InitStore => history_store.init_store(db).await,
+            Self::InitStore => history_store.init_store(&db).await,
 
             Self::Prune { dry_run } => {
-                Self::handle_prune(db, settings, store, context, dry_run).await
+                Self::handle_prune(&db, settings, store, context, dry_run).await
             }
         }
     }

@@ -6,11 +6,16 @@
       url = "github:edolstra/flake-compat";
       flake = false;
     };
+    fenix = {
+      url = "github:nix-community/fenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
   outputs = {
     self,
     nixpkgs,
     flake-utils,
+    fenix,
     ...
   }:
     flake-utils.lib.eachDefaultSystem (system: let
@@ -18,6 +23,18 @@
     in {
       packages.atuin = pkgs.callPackage ./atuin.nix {
         inherit (pkgs.darwin.apple_sdk.frameworks) Security SystemConfiguration AppKit;
+        rustPlatform = let
+          toolchain =
+            fenix.packages.${system}.fromToolchainFile
+            {
+              file = ./rust-toolchain.toml;
+              sha256 = "sha256-3jVIIf5XPnUU1CRaTyAiO0XHVbJl12MSx3eucTXCjtE=";
+            };
+        in
+          pkgs.makeRustPlatform {
+            cargo = toolchain;
+            rustc = toolchain;
+          };
       };
       packages.default = self.outputs.packages.${system}.atuin;
 

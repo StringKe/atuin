@@ -19,11 +19,11 @@ daemon = []
 check-update = []
 
 [dependencies]
-atuin-common = { path = "../atuin-common", version = "18.2.0" }
+atuin-common = { path = "../atuin-common", version = "18.4.0-beta.3" }
 
 log = { workspace = true }
 base64 = { workspace = true }
-time = { workspace = true, features = ["macros", "formatting"] }
+time = { workspace = true, features = ["macros", "formatting", "parsing"] }
 clap = { workspace = true }
 eyre = { workspace = true }
 directories = { workspace = true }
@@ -33,19 +33,19 @@ interim = { workspace = true }
 config = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-parse_duration = "2.1.1"
+humantime = "2.1.0"
 async-trait = { workspace = true }
 itertools = { workspace = true }
 rand = { workspace = true }
 shellexpand = "3"
 sqlx = { workspace = true, features = ["sqlite", "regexp"] }
 minspan = "0.1.1"
-regex = "1.10.4"
+regex = "1.10.5"
 serde_regex = "1.1.0"
 fs-err = { workspace = true }
 sql-builder = "3"
-memchr = "2.5"
-rmp = { version = "0.8.11" }
+memchr = "2.7"
+rmp = { version = "0.8.14" }
 typed-builder = { workspace = true }
 tokio = { workspace = true }
 semver = { workspace = true }
@@ -56,8 +56,8 @@ generic-array = { version = "0.14", features = ["serde"] }
 serde_with = "3.8.1"
 
 # encryption
-rusty_paseto = { version = "0.6.0", default-features = false }
-rusty_paserk = { version = "0.3.0", default-features = false, features = [
+rusty_paseto = { version = "0.7.0", default-features = false }
+rusty_paserk = { version = "0.4.0", default-features = false, features = [
   "v4",
   "serde",
 ] }
@@ -68,7 +68,16 @@ reqwest = { workspace = true, optional = true }
 hex = { version = "0.4", optional = true }
 sha2 = { version = "0.10", optional = true }
 indicatif = "0.17.7"
+tiny-bip39 = "1"
+
+# theme
+crossterm = { version = "0.27.0", features = ["serde"] }
+palette = { version = "0.7.5", features = ["serializing"] }
+lazy_static = "1.4.0"
+strum_macros = "0.26.3"
+strum = { version = "0.26.2", features = ["strum_macros"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 pretty_assertions = { workspace = true }
+testing_logger = "0.1.1"

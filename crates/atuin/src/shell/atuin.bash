@@ -269,8 +269,10 @@ __atuin_history() {
     fi
 }
 
-# shellcheck disable=SC2154
-if [[ ${BLE_VERSION-} ]] && ((_ble_version >= 400)); then
+__atuin_initialize_blesh() {
+    # shellcheck disable=SC2154
+    [[ ${BLE_VERSION-} ]] && ((_ble_version >= 400)) || return 0
+
     ble-import contrib/integration/bash-preexec
 
     # Define and register an autosuggestion source for ble.sh's auto-complete.
@@ -295,7 +297,9 @@ if [[ ${BLE_VERSION-} ]] && ((_ble_version >= 400)); then
     # BLE_SESSION_ID.  We explicitly export the variable because it was not
     # exported in older versions of ble.sh.
     [[ ${BLE_SESSION_ID-} ]] && export BLE_SESSION_ID
-fi
+}
+__atuin_initialize_blesh
+BLE_ONLOAD+=(__atuin_initialize_blesh)
 precmd_functions+=(__atuin_precmd)
 preexec_functions+=(__atuin_preexec)
 
@@ -329,12 +333,12 @@ if [[ $__atuin_bind_up_arrow == true ]]; then
         bind -m emacs '"\e[A": "\C-x\C-p"'
         bind -m emacs '"\eOA": "\C-x\C-p"'
         bind -m vi-insert -x '"\C-x\C-p": __atuin_history --shell-up-key-binding --keymap-mode=vim-insert'
-        bind -m vi-insert -x '"\e[A": "\C-x\C-p"'
-        bind -m vi-insert -x '"\eOA": "\C-x\C-p"'
+        bind -m vi-insert '"\e[A": "\C-x\C-p"'
+        bind -m vi-insert '"\eOA": "\C-x\C-p"'
         bind -m vi-command -x '"\C-x\C-p": __atuin_history --shell-up-key-binding --keymap-mode=vim-normal'
-        bind -m vi-command -x '"\e[A": "\C-x\C-p"'
-        bind -m vi-command -x '"\eOA": "\C-x\C-p"'
-        bind -m vi-command -x '"k": "\C-x\C-p"'
+        bind -m vi-command '"\e[A": "\C-x\C-p"'
+        bind -m vi-command '"\eOA": "\C-x\C-p"'
+        bind -m vi-command '"k": "\C-x\C-p"'
     fi
 fi
 

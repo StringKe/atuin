@@ -1,16 +1,20 @@
+use std::collections::HashMap;
+use std::fmt::Debug;
 use std::ops::Range;
 
 use async_trait::async_trait;
 use atuin_common::record::{EncryptedData, HostId, Record, RecordIdx, RecordStatus};
+use atuin_common::utils::crypto_random_string;
 use atuin_server_database::models::{History, NewHistory, NewSession, NewUser, Session, User};
 use atuin_server_database::{Database, DbError, DbResult};
 use futures_util::TryStreamExt;
+use metrics::counter;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
 
 use time::{OffsetDateTime, PrimitiveDateTime, UtcOffset};
-use tracing::instrument;
+use tracing::{instrument, trace};
 use uuid::Uuid;
 use wrappers::{DbHistory, DbRecord, DbSession, DbUser};
 
@@ -23,9 +27,24 @@ pub struct Postgres {
     pool: sqlx::Pool<sqlx::postgres::Postgres>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct PostgresSettings {
     pub db_uri: String,
+}
+
+// Do our best to redact passwords so they're not logged in the event of an error.
+impl Debug for PostgresSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_uri = url::Url::parse(&self.db_uri)
+            .map(|mut url| {
+                let _ = url.set_password(Some("****"));
+                url.to_string()
+            })
+            .unwrap_or(self.db_uri.clone());
+        f.debug_struct("PostgresSettings")
+            .field("db_uri", &redacted_uri)
+            .finish()
+    }
 }
 
 fn fix_error(error: sqlx::Error) -> DbError {
@@ -84,18 +103,100 @@ impl Database for Postgres {
 
     #[instrument(skip_all)]
     async fn get_user(&self, username: &str) -> DbResult<User> {
-        sqlx::query_as("select id, username, email, password from users where username = $1")
-            .bind(username)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(fix_error)
-            .map(|DbUser(user)| user)
+        sqlx::query_as(
+            "select id, username, email, password, verified_at from users where username = $1",
+        )
+        .bind(username)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(fix_error)
+        .map(|DbUser(user)| user)
+    }
+
+    #[instrument(skip_all)]
+    async fn user_verified(&self, id: i64) -> DbResult<bool> {
+        let res: (bool,) =
+            sqlx::query_as("select verified_at is not null from users where id = $1")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(fix_error)?;
+
+        Ok(res.0)
+    }
+
+    #[instrument(skip_all)]
+    async fn verify_user(&self, id: i64) -> DbResult<()> {
+        sqlx::query(
+            "update users set verified_at = (current_timestamp at time zone 'utc') where id=$1",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(fix_error)?;
+
+        Ok(())
+    }
+
+    /// Return a valid verification token for the user
+    /// If the user does not have any token, create one, insert it, and return
+    /// If the user has a token, but it's invalid, delete it, create a new one, return
+    /// If the user already has a valid token, return it
+    #[instrument(skip_all)]
+    async fn user_verification_token(&self, id: i64) -> DbResult<String> {
+        const TOKEN_VALID_MINUTES: i64 = 15;
+
+        // First we check if there is a verification token
+        let token: Option<(String, sqlx::types::time::OffsetDateTime)> = sqlx::query_as(
+            "select token, valid_until from user_verification_token where user_id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(fix_error)?;
+
+        let token = if let Some((token, valid_until)) = token {
+            trace!("Token for user {id} valid until {valid_until}");
+
+            // We have a token, AND it's still valid
+            if valid_until > time::OffsetDateTime::now_utc() {
+                token
+            } else {
+                // token has expired. generate a new one, return it
+                let token = crypto_random_string::<24>();
+
+                sqlx::query("update user_verification_token set token = $2, valid_until = $3 where user_id=$1")
+                    .bind(id)
+                    .bind(&token)
+                    .bind(time::OffsetDateTime::now_utc() + time::Duration::minutes(TOKEN_VALID_MINUTES))
+                    .execute(&self.pool)
+                    .await
+                    .map_err(fix_error)?;
+
+                token
+            }
+        } else {
+            // No token in the database! Generate one, insert it
+            let token = crypto_random_string::<24>();
+
+            sqlx::query("insert into user_verification_token (user_id, token, valid_until) values ($1, $2, $3)")
+                .bind(id)
+                .bind(&token)
+                .bind(time::OffsetDateTime::now_utc() + time::Duration::minutes(TOKEN_VALID_MINUTES))
+                .execute(&self.pool)
+                .await
+                .map_err(fix_error)?;
+
+            token
+        };
+
+        Ok(token)
     }
 
     #[instrument(skip_all)]
     async fn get_session_user(&self, token: &str) -> DbResult<User> {
         sqlx::query_as(
-            "select users.id, users.username, users.email, users.password from users 
+            "select users.id, users.username, users.email, users.password, users.verified_at from users 
             inner join sessions 
             on users.id = sessions.user_id 
             and sessions.token = $1",
@@ -302,19 +403,31 @@ impl Database for Postgres {
             .await
             .map_err(fix_error)?;
 
-        sqlx::query("delete from users where id = $1")
-            .bind(u.id)
-            .execute(&self.pool)
-            .await
-            .map_err(fix_error)?;
-
         sqlx::query("delete from history where user_id = $1")
             .bind(u.id)
             .execute(&self.pool)
             .await
             .map_err(fix_error)?;
 
+        sqlx::query("delete from store where user_id = $1")
+            .bind(u.id)
+            .execute(&self.pool)
+            .await
+            .map_err(fix_error)?;
+
+        sqlx::query("delete from user_verification_token where user_id = $1")
+            .bind(u.id)
+            .execute(&self.pool)
+            .await
+            .map_err(fix_error)?;
+
         sqlx::query("delete from total_history_count_user where user_id = $1")
+            .bind(u.id)
+            .execute(&self.pool)
+            .await
+            .map_err(fix_error)?;
+
+        sqlx::query("delete from users where id = $1")
             .bind(u.id)
             .execute(&self.pool)
             .await
@@ -408,6 +521,15 @@ impl Database for Postgres {
     async fn add_records(&self, user: &User, records: &[Record<EncryptedData>]) -> DbResult<()> {
         let mut tx = self.pool.begin().await.map_err(fix_error)?;
 
+        // We won't have uploaded this data if it wasn't the max. Therefore, we can deduce the max
+        // idx without having to make further database queries. Doing the query on this small
+        // amount of data should be much, much faster.
+        //
+        // Worst case, say we get this wrong. We end up caching data that isn't actually the max
+        // idx, so clients upload again. The cache logic can be verified with a sql query anyway :)
+
+        let mut heads = HashMap::<(HostId, &str), u64>::new();
+
         for i in records {
             let id = atuin_common::utils::uuid_v7();
 
@@ -428,6 +550,34 @@ impl Database for Postgres {
             .bind(&i.data.data)
             .bind(&i.data.content_encryption_key)
             .bind(user.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(fix_error)?;
+
+            // we're already iterating sooooo
+            heads
+                .entry((i.host.id, &i.tag))
+                .and_modify(|e| {
+                    if i.idx > *e {
+                        *e = i.idx
+                    }
+                })
+                .or_insert(i.idx);
+        }
+
+        // we've built the map of heads for this push, so commit it to the database
+        for ((host, tag), idx) in heads {
+            sqlx::query(
+                "insert into store_idx_cache
+                    (user_id, host, tag, idx) 
+                values ($1, $2, $3, $4)
+                on conflict(user_id, host, tag) do update set idx = greatest(store_idx_cache.idx, $4)
+                ",
+            )
+            .bind(user.id)
+            .bind(host)
+            .bind(tag)
+            .bind(idx as i64)
             .execute(&mut *tx)
             .await
             .map_err(fix_error)?;
@@ -494,16 +644,41 @@ impl Database for Postgres {
         const STATUS_SQL: &str =
             "select host, tag, max(idx) from store where user_id = $1 group by host, tag";
 
-        let res: Vec<(Uuid, String, i64)> = sqlx::query_as(STATUS_SQL)
+        let mut res: Vec<(Uuid, String, i64)> = sqlx::query_as(STATUS_SQL)
             .bind(user.id)
             .fetch_all(&self.pool)
             .await
             .map_err(fix_error)?;
+        res.sort();
+
+        // We're temporarily increasing latency in order to improve confidence in the cache
+        // If it runs for a few days, and we confirm that cached values are equal to realtime, we
+        // can replace realtime with cached.
+        //
+        // But let's check so sync doesn't do Weird Things.
+
+        let mut cached_res: Vec<(Uuid, String, i64)> =
+            sqlx::query_as("select host, tag, idx from store_idx_cache where user_id = $1")
+                .bind(user.id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(fix_error)?;
+        cached_res.sort();
 
         let mut status = RecordStatus::new();
 
-        for i in res {
-            status.set_raw(HostId(i.0), i.1, i.2 as u64);
+        let equal = res == cached_res;
+
+        if equal {
+            counter!("atuin_store_idx_cache_consistent", 1);
+        } else {
+            // log the values if we have an inconsistent cache
+            tracing::debug!(user = user.username, cache_match = equal, res = ?res, cached = ?cached_res, "record store index request");
+            counter!("atuin_store_idx_cache_inconsistent", 1);
+        };
+
+        for i in res.iter() {
+            status.set_raw(HostId(i.0), i.1.clone(), i.2 as u64);
         }
 
         Ok(status)

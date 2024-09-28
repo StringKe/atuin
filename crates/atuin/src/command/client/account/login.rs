@@ -35,9 +35,13 @@ fn get_input() -> Result<String> {
 
 impl Cmd {
     pub async fn run(&self, settings: &Settings, store: &SqliteStore) -> Result<()> {
-        let session_path = settings.session_path.as_str();
-
-        if PathBuf::from(session_path).exists() {
+        // TODO(ellie): Replace this with a call to atuin_client::login::login
+        // The reason I haven't done this yet is that this implementation allows for
+        // an empty key. This will use an existing key file.
+        //
+        // I'd quite like to ditch that behaviour, so have not brought it into the library
+        // function.
+        if settings.logged_in() {
             println!(
                 "You are already logged in! Please run 'atuin logout' if you wish to login again"
             );

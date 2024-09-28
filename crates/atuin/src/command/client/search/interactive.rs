@@ -31,16 +31,16 @@ use super::{
     cursor::Cursor,
     engines::{SearchEngine, SearchState},
     history_list::{HistoryList, ListState, PREFIX_LENGTH},
-    sort,
 };
 
+use crate::command::client::theme::{Meaning, Theme};
 use crate::{command::client::search::engines, VERSION};
 
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout},
     prelude::*,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{block::Title, Block, BorderType, Borders, Padding, Paragraph, Tabs},
     Frame, Terminal, TerminalOptions, Viewport,
@@ -96,7 +96,10 @@ impl State {
         self.results_len = results.len();
 
         if smart_sort {
-            Ok(sort::sort(self.search.input.as_str(), results))
+            Ok(atuin_history::sort::sort(
+                self.search.input.as_str(),
+                results,
+            ))
         } else {
             Ok(results)
         }
@@ -204,7 +207,10 @@ impl State {
         let esc_allow_exit = !(self.tab_index == 0 && self.keymap_mode == KeymapMode::VimInsert);
 
         // support ctrl-a prefix, like screen or tmux
-        if ctrl && input.code == KeyCode::Char('a') {
+        if !self.prefix
+            && ctrl
+            && input.code == KeyCode::Char(settings.keys.prefix.chars().next().unwrap_or('a'))
+        {
             self.prefix = true;
             return InputAction::Continue;
         }
@@ -299,6 +305,8 @@ impl State {
                 }
                 KeyCode::Char('a') => {
                     self.search.input.start();
+                    //  This prevents pressing ctrl-a twice while still in prefix mode
+                    self.prefix = false;
                     return InputAction::Continue;
                 }
                 _ => {}
@@ -575,6 +583,8 @@ impl State {
                         .sum(),
                 )
             }) + border_size * 2
+        } else if settings.show_preview && settings.preview.strategy == PreviewStrategy::Fixed {
+            settings.max_preview_height + border_size * 2
         } else if compact || tab_index == 1 {
             0
         } else {
@@ -591,6 +601,7 @@ impl State {
         results: &[History],
         stats: Option<HistoryStats>,
         settings: &Settings,
+        theme: &Theme,
     ) {
         let compact = match settings.style {
             atuin_client::settings::Style::Auto => f.size().height < 14,
@@ -615,7 +626,7 @@ impl State {
             .direction(Direction::Vertical)
             .margin(0)
             .horizontal_margin(1)
-            .constraints(
+            .constraints::<&[Constraint]>(
                 if invert {
                     [
                         Constraint::Length(1 + border_size),               // input
@@ -664,7 +675,7 @@ impl State {
 
         let header_chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints(
+            .constraints::<&[Constraint]>(
                 [
                     Constraint::Ratio(1, 5),
                     Constraint::Ratio(3, 5),
@@ -674,19 +685,19 @@ impl State {
             )
             .split(header_chunk);
 
-        let title = self.build_title();
+        let title = self.build_title(theme);
         f.render_widget(title, header_chunks[0]);
 
-        let help = self.build_help(settings);
+        let help = self.build_help(settings, theme);
         f.render_widget(help, header_chunks[1]);
 
-        let stats_tab = self.build_stats();
+        let stats_tab = self.build_stats(theme);
         f.render_widget(stats_tab, header_chunks[2]);
 
         match self.tab_index {
             0 => {
                 let results_list =
-                    Self::build_results_list(style, results, self.keymap_mode, &self.now);
+                    Self::build_results_list(style, results, self.keymap_mode, &self.now, theme);
                 f.render_stateful_widget(results_list, results_list_chunk, &mut self.results_state);
             }
 
@@ -709,6 +720,7 @@ impl State {
                         results_list_chunk,
                         &results[self.results_state.selected()],
                         &stats.expect("Drawing inspector, but no stats"),
+                        theme,
                     );
                 }
 
@@ -733,8 +745,13 @@ impl State {
         } else {
             preview_width - 2
         };
-        let preview =
-            self.build_preview(results, compact, preview_width, preview_chunk.width.into());
+        let preview = self.build_preview(
+            results,
+            compact,
+            preview_width,
+            preview_chunk.width.into(),
+            theme,
+        );
         f.render_widget(preview, preview_chunk);
 
         let extra_width = UnicodeWidthStr::width(self.search.input.substring());
@@ -747,23 +764,25 @@ impl State {
         );
     }
 
-    fn build_title(&mut self) -> Paragraph {
+    fn build_title(&self, theme: &Theme) -> Paragraph {
         let title = if self.update_needed.is_some() {
+            let error_style: Style = theme.get_error().into();
             Paragraph::new(Text::from(Span::styled(
                 format!("Atuin v{VERSION} - UPGRADE"),
-                Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
+                error_style.add_modifier(Modifier::BOLD),
             )))
         } else {
+            let style: Style = theme.as_style(Meaning::Base).into();
             Paragraph::new(Text::from(Span::styled(
                 format!("Atuin v{VERSION}"),
-                Style::default().add_modifier(Modifier::BOLD),
+                style.add_modifier(Modifier::BOLD),
             )))
         };
         title.alignment(Alignment::Left)
     }
 
     #[allow(clippy::unused_self)]
-    fn build_help(&self, settings: &Settings) -> Paragraph {
+    fn build_help(&self, settings: &Settings, theme: &Theme) -> Paragraph {
         match self.tab_index {
             // search
             0 => Paragraph::new(Text::from(Line::from(vec![
@@ -797,16 +816,16 @@ impl State {
 
             _ => unreachable!("invalid tab index"),
         }
-        .style(Style::default().fg(Color::DarkGray))
+        .style(theme.as_style(Meaning::Annotation))
         .alignment(Alignment::Center)
     }
 
-    fn build_stats(&mut self) -> Paragraph {
+    fn build_stats(&self, theme: &Theme) -> Paragraph {
         let stats = Paragraph::new(Text::from(Span::raw(format!(
             "history count: {}",
             self.history_count,
         ))))
-        .style(Style::default().fg(Color::DarkGray))
+        .style(theme.as_style(Meaning::Annotation))
         .alignment(Alignment::Right);
         stats
     }
@@ -816,12 +835,14 @@ impl State {
         results: &'a [History],
         keymap_mode: KeymapMode,
         now: &'a dyn Fn() -> OffsetDateTime,
+        theme: &'a Theme,
     ) -> HistoryList<'a> {
         let results_list = HistoryList::new(
             results,
             style.invert,
             keymap_mode == KeymapMode::VimNormal,
             now,
+            theme,
         );
 
         if style.compact {
@@ -842,7 +863,7 @@ impl State {
         }
     }
 
-    fn build_input(&mut self, style: StyleState) -> Paragraph {
+    fn build_input(&self, style: StyleState) -> Paragraph {
         /// Max width of the UI box showing current mode
         const MAX_WIDTH: usize = 14;
         let (pref, mode) = if self.switched_search_mode {
@@ -874,11 +895,12 @@ impl State {
     }
 
     fn build_preview(
-        &mut self,
+        &self,
         results: &[History],
         compact: bool,
         preview_width: u16,
         chunk_width: usize,
+        theme: &Theme,
     ) -> Paragraph {
         let selected = self.results_state.selected();
         let command = if results.is_empty() {
@@ -898,7 +920,7 @@ impl State {
                 .join("\n")
         };
         let preview = if compact {
-            Paragraph::new(command).style(Style::default().fg(Color::DarkGray))
+            Paragraph::new(command).style(theme.as_style(Meaning::Annotation))
         } else {
             Paragraph::new(command).block(
                 Block::default()
@@ -986,6 +1008,7 @@ pub async fn history(
     settings: &Settings,
     mut db: impl Database,
     history_store: &HistoryStore,
+    theme: &Theme,
 ) -> Result<String> {
     let stdout = Stdout::new(settings.inline_height > 0)?;
     let backend = CrosstermBackend::new(stdout);
@@ -1062,7 +1085,7 @@ pub async fn history(
     let mut stats: Option<HistoryStats> = None;
     let accept;
     let result = 'render: loop {
-        terminal.draw(|f| app.draw(f, &results, stats.clone(), settings))?;
+        terminal.draw(|f| app.draw(f, &results, stats.clone(), settings, theme))?;
 
         let initial_input = app.search.input.as_str().to_owned();
         let initial_filter_mode = app.search.filter_mode;
@@ -1096,7 +1119,7 @@ pub async fn history(
                             },
                             InputAction::Redraw => {
                                 terminal.clear()?;
-                                terminal.draw(|f| app.draw(f, &results, stats.clone(), settings))?;
+                                terminal.draw(|f| app.draw(f, &results, stats.clone(), settings, theme))?;
                             },
                             r => {
                                 accept = app.accept;
@@ -1174,7 +1197,10 @@ pub async fn history(
     any(target_os = "windows", target_os = "macos", target_os = "linux")
 ))]
 fn set_clipboard(s: String) {
-    cli_clipboard::set_contents(s).unwrap();
+    let mut ctx = arboard::Clipboard::new().unwrap();
+    ctx.set_text(s).unwrap();
+    // Use the clipboard context to make sure it is saved
+    ctx.get_text().unwrap();
 }
 
 #[cfg(not(all(
@@ -1215,6 +1241,15 @@ mod tests {
             },
             show_preview: true,
             max_preview_height: 4,
+            ..Settings::utc()
+        };
+
+        let settings_preview_fixed = Settings {
+            preview: Preview {
+                strategy: PreviewStrategy::Fixed,
+            },
+            show_preview: true,
+            max_preview_height: 15,
             ..Settings::utc()
         };
 
@@ -1311,14 +1346,26 @@ mod tests {
             1,
             20,
         );
+        // the longest command requires 10 lines, but we have a max preview height of 15 and a fixed preview strategy
+        let settings_preview_fixed = State::calc_preview_height(
+            &settings_preview_fixed,
+            &results,
+            1 as usize,
+            0 as usize,
+            false,
+            1,
+            20,
+        );
 
         assert_eq!(no_preview, 1);
-        // 1*2 is the space for the border
-        assert_eq!(preview_h2, 2 + 1 * 2);
-        assert_eq!(preview_h3, 3 + 1 * 2);
-        assert_eq!(preview_one_line, 1 + 1 * 2);
-        assert_eq!(preview_limit_at_2, 2 + 1 * 2);
-        assert_eq!(preview_static_h3, 3 + 1 * 2);
-        assert_eq!(preview_static_limit_at_4, 4 + 1 * 2);
+        // 1 * 2 is the space for the border
+        let border_space = 1 * 2;
+        assert_eq!(preview_h2, 2 + border_space);
+        assert_eq!(preview_h3, 3 + border_space);
+        assert_eq!(preview_one_line, 1 + border_space);
+        assert_eq!(preview_limit_at_2, 2 + border_space);
+        assert_eq!(preview_static_h3, 3 + border_space);
+        assert_eq!(preview_static_limit_at_4, 4 + border_space);
+        assert_eq!(settings_preview_fixed, 15 + border_space);
     }
 }

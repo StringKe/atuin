@@ -1,6 +1,7 @@
 use std::process::Command;
 use std::{env, path::PathBuf, str::FromStr};
 
+use atuin_client::database::Sqlite;
 use atuin_client::settings::Settings;
 use atuin_common::shell::{shell_name, Shell};
 use colored::Colorize;
@@ -261,10 +262,12 @@ struct AtuinInfo {
     /// Whether the main Atuin sync server is in use
     /// I'm just calling it Atuin Cloud for lack of a better name atm
     pub sync: Option<SyncInfo>,
+
+    pub sqlite_version: String,
 }
 
 impl AtuinInfo {
-    pub fn new(settings: &Settings) -> Self {
+    pub async fn new(settings: &Settings) -> Self {
         let session_path = settings.session_path.as_str();
         let logged_in = PathBuf::from(session_path).exists();
 
@@ -274,9 +277,18 @@ impl AtuinInfo {
             None
         };
 
+        let sqlite_version = match Sqlite::new("sqlite::memory:", 0.1).await {
+            Ok(db) => db
+                .sqlite_version()
+                .await
+                .unwrap_or_else(|_| "unknown".to_string()),
+            Err(_) => "error".to_string(),
+        };
+
         Self {
             version: crate::VERSION.to_string(),
             sync,
+            sqlite_version,
         }
     }
 }
@@ -289,9 +301,9 @@ struct DoctorDump {
 }
 
 impl DoctorDump {
-    pub fn new(settings: &Settings) -> Self {
+    pub async fn new(settings: &Settings) -> Self {
         Self {
-            atuin: AtuinInfo::new(settings),
+            atuin: AtuinInfo::new(settings).await,
             shell: ShellInfo::new(),
             system: SystemInfo::new(),
         }
@@ -303,7 +315,7 @@ fn checks(info: &DoctorDump) {
                 //
     let zfs_error = "[Filesystem] ZFS is known to have some issues with SQLite. Atuin uses SQLite heavily. If you are having poor performance, there are some workarounds here: https://github.com/atuinsh/atuin/issues/952".bold().red();
     let bash_plugin_error = "[Shell] If you are using Bash, Atuin requires that either bash-preexec or ble.sh be installed. An older ble.sh may not be detected. so ignore this if you have it set up! Read more here: https://docs.atuin.sh/guide/installation/#bash".bold().red();
-    let blesh_loading_order_error = "[Shell] Atuin seems to be loaded before ble.sh is sourced. In .bashrc, make sure to initialize Atuin after sourcing ble.sh.".bold().red();
+    let blesh_integration_error = "[Shell] Atuin and ble.sh seem to be loaded in the session, but the integration does not seem to be working. Please check the setup in .bashrc.".bold().red();
 
     // ZFS: https://github.com/atuinsh/atuin/issues/952
     if info.system.disks.iter().any(|d| d.filesystem == "zfs") {
@@ -325,19 +337,19 @@ fn checks(info: &DoctorDump) {
             && info.shell.plugins.iter().any(|plugin| plugin == "blesh")
             && info.shell.preexec.as_ref().is_some_and(|val| val == "none")
         {
-            println!("{blesh_loading_order_error}");
+            println!("{blesh_integration_error}");
         }
     }
 }
 
-pub fn run(settings: &Settings) -> Result<()> {
+pub async fn run(settings: &Settings) -> Result<()> {
     println!("{}", "Atuin Doctor".bold());
     println!("Checking for diagnostics");
-    let dump = DoctorDump::new(settings);
+    let dump = DoctorDump::new(settings).await;
 
     checks(&dump);
 
-    let dump = serde_yaml::to_string(&dump)?;
+    let dump = serde_json::to_string_pretty(&dump)?;
 
     println!("\nPlease include the output below with any bug reports or issues\n");
     println!("{dump}");
